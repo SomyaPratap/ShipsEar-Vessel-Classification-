@@ -1,0 +1,24 @@
+# Large data files
+features/
+models/
+shipsear_processed/
+*.npy
+*.pth
+*.pkl
+splits.json
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# LaTeX build files
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
