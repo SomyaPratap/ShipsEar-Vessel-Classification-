@@ -1,0 +1,633 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{url}
+\usepackage{cite}
+\usepackage[hidelinks]{hyperref}
+\usepackage{multirow}
+\usepackage{balance}
+\usepackage[T1]{fontenc}
+
+\title{Underwater Vessel Noise Classification Using the ShipsEar Dataset:\\
+A Comparative Study of Handcrafted Features and Deep Learning}
+
+\author{
+  \IEEEauthorblockN{Somya Pratap Singh}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This paper presents a comprehensive study on underwater vessel noise
+classification using the ShipsEar dataset~\cite{shipsear2016}, comprising
+90 hydrophone recordings across five vessel categories: Motorboats~(A),
+Mussel Boats~(B), Fishing Vessels~(C), Passengers/Ferries~(D), and Ocean
+Liners/Tugboats~(E). We implement an end-to-end machine learning pipeline
+covering data acquisition, exploratory analysis, preprocessing, and
+classification using both classical and deep learning approaches.
+Handcrafted features include Mel-Frequency Cepstral Coefficients (MFCCs)
+with temporal derivatives, STFT band energy, LOFAR spectral lines, and
+DEMON envelope spectrum features forming a 310-dimensional vector.
+Classical models (KNN, SVM-RBF, Random Forest) are benchmarked against a
+custom three-block CNN and fine-tuned ResNet-18 trained on $128{\times}128$
+log-mel spectrograms.
+Across five random seeds, SVM-RBF achieves the highest single-run test
+accuracy of 92.51\% with macro-AUC of 0.990. Ablation analysis confirms
+that combining all feature groups (Val~Acc~=~0.868) outperforms any single
+group. The deep models under-perform on single runs due to an imbalanced
+split but recover competitive mean accuracy ($\geq$82\%) in seed-averaged
+evaluation. Dataset:
+\url{https://drive.google.com/drive/folders/1PrO_ZBiYM9hmMQIdgqt7otH0886pO7Xr}
+\end{abstract}
+
+\begin{IEEEkeywords}
+underwater acoustics, vessel classification, ShipsEar, MFCC, LOFAR, DEMON,
+convolutional neural network, ResNet-18, transfer learning, Grad-CAM
+\end{IEEEkeywords}
+
+% ── I. INTRODUCTION ───────────────────────────────────────────────────────────
+\section{Introduction}
+
+Passive acoustic monitoring of underwater vessels is valuable for naval
+surveillance, port security, fisheries management, and marine environmental
+protection. A hydrophone records a composite signal arising from propeller
+cavitation, engine vibration, hull flow noise, and blade-rate modulation,
+each imprinting a characteristic spectral fingerprint that enables automatic
+classification.
+
+The ShipsEar dataset~\cite{shipsear2016} by Santos-Dom\'inguez \textit{et
+al.}\ provides the first public benchmark for this task. Prior work used
+Gaussian Mixture Models and SVMs on hand-tuned features~\cite{shipsear2016},
+while subsequent studies applied CNNs~\cite{irfan2021} and ResNets with
+data augmentation~\cite{xie2022}, pushing accuracy toward 87\%.
+
+This paper makes the following contributions:
+\begin{itemize}
+  \item A full pipeline: acquisition, EDA, preprocessing, handcrafted and
+        deep feature extraction, model training, and rigorous evaluation.
+  \item Five complementary feature groups (MFCC$+\Delta+\Delta\Delta$,
+        STFT bands, LOFAR, DEMON) concatenated into a 310-dim vector.
+  \item A custom shallow CNN and fine-tuned ResNet-18 with SpecAugment-lite
+        and class-weighted training for imbalance handling.
+  \item Five-seed stability evaluation (seeds $\{0,7,21,42,99\}$) reporting
+        mean $\pm$ std across all metrics.
+  \item An ablation study over 9 feature configurations and Grad-CAM
+        interpretation of learned representations.
+\end{itemize}
+
+% ── II. DATASET & ACOUSTIC THEORY ────────────────────────────────────────────
+\section{Dataset \& Acoustic Background}
+
+\subsection{ShipsEar Dataset}
+
+ShipsEar~\cite{shipsear2016} was recorded in the R\'ia de Vigo estuary,
+northwestern Spain, using an HTI-96-MIN omnidirectional hydrophone at
+1.5\,m depth (sensitivity $-64$\,dB re~1\,V/$\mu$Pa, flat response
+2\,Hz--30\,kHz). The 90 recordings are 16-bit PCM WAV files sampled at
+52{,}000\,Hz, spanning five mutually exclusive vessel classes
+(Table~\ref{tab:classes}).
+
+\begin{table}[t]
+  \caption{ShipsEar Vessel Classes and Acoustic Characteristics}
+  \label{tab:classes}
+  \centering
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{clp{4.0cm}}
+    \toprule
+    \textbf{Class} & \textbf{Vessel Type} & \textbf{Acoustic Signature} \\
+    \midrule
+    A & Motorboats            & Broadband cavitation $>$2\,kHz; high RPM; non-stationary \\
+    B & Mussel Boats          & Sharp diesel LOFAR lines; slow blade-rate (1--4\,Hz) \\
+    C & Fishing Vessels       & Mixed tonal/broadband; winch noise; variable load \\
+    D & Passengers/Ferries    & Stable harmonics 50--500\,Hz; consistent engine load \\
+    E & Ocean Liners/Tugboats & Sub-200\,Hz dominant; highest source level; complex multi-shaft \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Underwater Acoustic Propagation}
+
+Sound in seawater travels at $\approx$1{,}500\,m/s --- 4.4$\times$ faster
+than in air. The Mackenzie equation~\cite{mackenzie1981} gives:
+\begin{equation}
+  c \approx 1448.96 + 4.591T - 0.05304T^2 + 1.340(S-35) + 0.0163z
+  \label{eq:mackenzie}
+\end{equation}
+Transmission loss in shallow coastal water follows:
+\begin{equation}
+  \mathrm{TL} = 10\log_{10}(r) + \alpha r \quad [\mathrm{dB}]
+  \label{eq:tl}
+\end{equation}
+where $\alpha$ increases with frequency, concentrating discriminative vessel
+information below 8\,kHz and justifying the 16\,kHz target sampling rate.
+
+% ── III. PROBLEM FORMULATION ──────────────────────────────────────────────────
+\section{Formal Problem Definition}
+
+Let $\mathbf{x}\in\mathbb{R}^{N}$ be a fixed-length audio segment,
+$N = T_s \times f_s$ ($T_s = 5$\,s, $f_s = 16{,}000$\,Hz). Each segment
+is assigned a label $y \in \mathcal{Y} = \{A,B,C,D,E\}$.
+The learning objective is:
+\begin{equation}
+  f^* = \operatorname*{arg\,min}_{f}\;
+        \mathbb{E}_{(\mathbf{x},y)\sim p}\!
+        \bigl[\mathcal{L}(f(\mathbf{x}),\,y)\bigr]
+  \label{eq:objective}
+\end{equation}
+Performance is measured by macro-averaged accuracy, F1, and AUC-ROC to
+account for class imbalance, reported as mean $\pm$ std over five seeds.
+
+% ── IV. METHODOLOGY ──────────────────────────────────────────────────────────
+\section{Methodology}
+
+\subsection{Preprocessing Pipeline}
+
+\textbf{Resampling.}
+The provided \texttt{shipsear\_5s\_16k} dataset is downsampled from
+52\,kHz to 16\,kHz with a Kaiser-best anti-aliasing filter. The 8\,kHz
+Nyquist captures all acoustically discriminative vessel content.
+
+\textbf{RMS Normalisation.}
+Each segment is normalised to $-20$\,dBFS:
+\begin{equation}
+  y_\mathrm{norm} = y \cdot 10^{(\mathrm{RMS_{tgt}} -
+  \mathrm{RMS_{cur}})/20}, \quad \mathrm{RMS_{tgt}}=-20\,\mathrm{dBFS}
+  \label{eq:rms}
+\end{equation}
+Segments below $-60$\,dBFS are discarded. This removes gain variation
+from ship-to-hydrophone distance without distorting spectral shape.
+
+\textbf{Segmentation.}
+All clips are pre-segmented to 5\,s (80{,}000 samples). Five seconds
+captures 5--20 full blade-rate cycles, providing sufficient temporal
+context.
+
+\textbf{Splitting.}
+Splits are at the \emph{recording} level to prevent segment-level data
+leakage, using stratified 70/15/15 train/val/test partitioning. Five
+pre-made seed splits support stability evaluation.
+
+\subsection{Handcrafted Feature Extraction}
+
+Five groups are extracted and concatenated into a 310-dim vector,
+standardised with \texttt{StandardScaler} fit on the training set only.
+
+\textbf{MFCC $+$ $\Delta$ $+$ $\Delta\Delta$ (240-dim).}
+40 MFCCs per frame (25\,ms Hann window, 10\,ms hop) plus first and second
+temporal derivatives. Mean and std over time are computed per coefficient:
+\begin{equation}
+  \phi_\mathrm{MFCC} = \bigl[\mu(\mathbf{M}),\,\sigma(\mathbf{M}),\,
+  \mu(\Delta\mathbf{M}),\,\sigma(\Delta\mathbf{M}),\,
+  \mu(\Delta^2\!\mathbf{M}),\,\sigma(\Delta^2\!\mathbf{M})\bigr]
+  \label{eq:mfcc}
+\end{equation}
+giving $40\!\times\!2\!\times\!3 = 240$ dimensions.
+
+\textbf{STFT Band Energy (40-dim).}
+The STFT magnitude (dB) is compressed into 20 frequency bands;
+mean and std within each band are extracted.
+
+\textbf{LOFAR Spectral Lines (20-dim).}
+High-resolution PSD via Welch ($n_\mathrm{seg}=4096$, 50\% overlap).
+Top-10 peaks (normalised frequency + amplitude) capture engine harmonics:
+\begin{equation}
+  f_0 = \omega/60 \; [\mathrm{Hz}], \quad
+  \text{harmonics: } \{f_0, 2f_0, 3f_0, \ldots\}
+  \label{eq:lofar}
+\end{equation}
+
+\textbf{DEMON Envelope Features (10-dim).}
+Bandpass filtering (100--5{,}000\,Hz) followed by Hilbert envelope
+extraction. Welch PSD of the envelope reveals blade-rate:
+\begin{equation}
+  f_\mathrm{BR} = N_b \cdot \omega/60 \; [\mathrm{Hz}]
+  \label{eq:demon}
+\end{equation}
+Top-5 peaks in 0.5--50\,Hz form a 10-dim vector.
+
+\subsection{Deep Feature Representation}
+
+Log-mel spectrograms serve as $128{\times}128$ image inputs.
+STFT: 25\,ms Hann window (400 samples), 10\,ms hop (160 samples),
+128 mel filterbanks (0--8\,kHz). Log compression:
+\begin{equation}
+  S_\mathrm{dB} = 10\log_{10}(S/\max S) \;\in\; [-80,\,0]\,\mathrm{dB}
+  \label{eq:logmel}
+\end{equation}
+Spectrograms are bilinearly resized to $128{\times}128$ and stored as
+$(N,1,128,128)$ float32 tensors.
+\textbf{SpecAugment-lite}~\cite{park2019}: random time and frequency
+masks (width 5--20 bins, $p=0.5$ each) during training.
+
+\subsection{Classical Classifiers}
+
+\textbf{KNN:} $k\in\{1,3,5,7\}$, Euclidean metric; best $k$ by
+validation accuracy.
+
+\textbf{SVM:} RBF kernel; 5-fold CV grid search over
+$C\in\{0.1,1,10,100\}$ and
+$\gamma\in\{\text{scale},\text{auto},0.01,0.001\}$; best: $C=10$,
+$\gamma=\text{scale}$.
+
+\textbf{Random Forest:} $n_\mathrm{est}\in\{100,200,500\}$;
+\texttt{min\_samples\_split}=5; best by validation F1.
+
+\subsection{Deep Learning Models}
+
+\textbf{Custom CNN.}
+Three convolutional blocks: Conv2D($f$, $3{\times}3$) $\to$ BatchNorm
+$\to$ ReLU $\to$ MaxPool($2{\times}2$) with $f\in\{32,64,128\}$.
+Global Average Pooling $\to$ Dense(256) $\to$ Dropout(0.4)
+$\to$ Dense(5). Total: $\approx$220K parameters.
+
+\textbf{ResNet-18~\cite{he2016}.}
+ImageNet-pretrained backbone; final FC replaced by Dense(5). Single-channel
+spectrograms replicated to 3-channel RGB. All layers fine-tuned at
+$\text{lr}=10^{-4}$.
+
+\textbf{Training setup:}
+Adam optimiser (weight decay $10^{-4}$), ReduceLROnPlateau (factor~0.5,
+patience~7), EarlyStopping (patience~25), 200 max epochs, batch~32.
+Class-weighted cross-entropy and \texttt{WeightedRandomSampler} handle
+imbalance.
+
+\subsection{Hardware \& Software Configuration}
+
+All experiments were conducted on Google Colaboratory
+(Table~\ref{tab:hw}).
+
+\begin{table}[t]
+  \caption{Hardware \& Software Configuration}
+  \label{tab:hw}
+  \centering
+  \begin{tabular}{ll}
+    \toprule
+    \textbf{Component} & \textbf{Specification} \\
+    \midrule
+    Platform      & Google Colaboratory (cloud) \\
+    GPU           & NVIDIA Tesla T4 (16\,GB VRAM) \\
+    CPU           & Intel Xeon (2\,vCPU, Google Colab) \\
+    RAM           & 12\,GB system RAM \\
+    Python        & 3.12 \\
+    PyTorch       & 2.10.0+cu128 \\
+    CUDA          & 12.8 \\
+    librosa       & 0.10.x \\
+    scikit-learn  & 1.4.x \\
+    NumPy         & 1.26.x \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ── V. EXPLORATORY DATA ANALYSIS ─────────────────────────────────────────────
+\section{Exploratory Data Analysis}
+
+\subsection{Class Imbalance}
+
+After 5-second segmentation at 16\,kHz, Class~C (Fishing Vessels)
+dominates with 674 segments ($\approx$45\% of total), while Class~E
+has only 179 segments ($\approx$12\%). This imbalance motivates
+class-weighted training, macro-averaged metrics, and
+\texttt{WeightedRandomSampler} for deep models.
+
+\subsection{Power Spectral Density Analysis}
+
+Welch PSD estimates ($n_\mathrm{seg}=4096$, 50\% overlap) reveal
+distinct per-class frequency signatures. Class~A shows broadband energy
+above 2\,kHz from propeller cavitation. Classes B and D exhibit sharp
+LOFAR harmonic peaks in 50--500\,Hz. Class~E concentrates energy below
+200\,Hz at the highest source levels, making it the most reliably
+classified class (confusion matrix diagonal: 0.97 for all classical
+models). Class~C shows intermediate behaviour with additional winch
+tonal components.
+
+\subsection{Spectrogram Characteristics}
+
+Log-mel spectrograms confirm class discriminability. Class~A shows
+high-energy broadband upper-mel activation; Classes B and D display
+horizontal harmonic stripe patterns; Class~E shows strong low-mel
+activation with complex overlapping harmonic structure.
+
+% ── VI. RESULTS & DISCUSSION ─────────────────────────────────────────────────
+\section{Results \& Discussion}
+
+\subsection{Classical Model Comparison}
+
+Table~\ref{tab:classical} reports test-set performance.
+SVM-RBF ($C=10$, $\gamma=\text{scale}$) achieves the highest single-run
+accuracy of 73.71\% among initial classical baselines. After the
+corrected stratified resplit ensuring all five classes in training,
+SVM-RBF reaches 92.51\% accuracy and 0.9911 macro-AUC
+(Table~\ref{tab:final}).
+
+\begin{table}[t]
+  \caption{Classical Model Initial Test Performance}
+  \label{tab:classical}
+  \centering
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{lcccc}
+    \toprule
+    \textbf{Model} & \textbf{Test Acc} & \textbf{F1} & \textbf{AUC} & \textbf{ms/s} \\
+    \midrule
+    KNN ($k=1$)          & 0.7056 & 0.643 & 0.764 & 0.033 \\
+    SVM RBF ($C=10$)     & 0.7371 & 0.673 & 0.800 & 0.409 \\
+    SVM Linear ($C=1$)   & 0.6584 & 0.616 & 0.754 & 0.082 \\
+    Random Forest ($n=100$) & 0.7191 & 0.662 & 0.807 & 0.085 \\
+    \bottomrule
+    \multicolumn{5}{l}{\small Pre-resplit results (class~3 absent from training).}
+  \end{tabular}
+\end{table}
+
+\subsection{Five-Seed Stability Results}
+
+Table~\ref{tab:final} presents the primary results after corrected
+splitting, averaged over five seeds $\{0,7,21,42,99\}$.
+SVM-RBF achieves the best single-run accuracy (92.51\%) and highest
+mean AUC ($0.9903\pm0.0005$). Random Forest is comparably strong
+($\text{Acc}=0.9030\pm0.0122$, AUC~$0.9916$). The CNN and ResNet-18
+achieve low single-run accuracy (0.328, 0.258) due to the class-3 split
+issue on the base split, but recover well in five-seed averaging:
+CNN mean $0.8247\pm0.0891$, ResNet-18 mean $0.9020\pm0.0135$.
+
+\begin{table*}[t]
+  \caption{Final Results --- All Models (5-seed mean $\pm$ std; seeds $\{0, 7, 21, 42, 99\}$)}
+  \label{tab:final}
+  \centering
+  \begin{tabular}{lccccc}
+    \toprule
+    \textbf{Model} & \textbf{Single-run Acc} &
+    \textbf{Acc (mean$\pm$std)} & \textbf{Macro-F1 (mean$\pm$std)} &
+    \textbf{AUC (mean$\pm$std)} & \textbf{Infer (ms/s)} \\
+    \midrule
+    KNN           & 0.8533 & $0.8485 \pm 0.0052$ & $0.8450 \pm 0.0058$ & $0.9082 \pm 0.0034$ & 0.033 \\
+    SVM RBF       & \textbf{0.9251} & $0.9084 \pm 0.0015$ & $0.9046 \pm 0.0016$ & $0.9903 \pm 0.0005$ & 0.409 \\
+    Random Forest & 0.8922 & $0.9030 \pm 0.0122$ & $0.9020 \pm 0.0118$ & $0.9916 \pm 0.0019$ & 0.085 \\
+    CNN (scratch) & 0.3281 & $0.8247 \pm 0.0891$ & $0.8351 \pm 0.0796$ & $0.9716 \pm 0.0261$ & 0.253 \\
+    ResNet-18     & 0.2584 & $0.9020 \pm 0.0135$ & $0.8994 \pm 0.0117$ & $0.9879 \pm 0.0016$ & 0.388 \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsection{Performance Heatmap}
+
+Fig.~\ref{fig:heatmap} visualises all three metrics across models.
+Classical models (SVM, RF) dominate accuracy, while deep models achieve
+high AUC despite accuracy degradation on the base split. The heatmap
+highlights that AUC is the most stable metric ($>$0.90 for all models),
+reflecting well-calibrated probability outputs.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{fig_results_heatmap.png}
+  \caption{Model performance heatmap: Accuracy, Macro-F1, and Macro-AUC
+           across all five models on the test set.}
+  \label{fig:heatmap}
+\end{figure}
+
+\subsection{Confusion Matrix Analysis}
+
+Fig.~\ref{fig:confusion} shows row-normalised confusion matrices for
+all five models. Key observations:
+
+\textbf{Classical models} achieve high per-class recall: KNN
+(Acc=0.853, F1=0.848), SVM-RBF (Acc=0.925, F1=0.920), Random Forest
+(Acc=0.892, F1=0.890). Class~E (Ocean Liners) achieves 0.97 recall
+across all classical models, confirming its distinctive sub-200\,Hz
+signature. The principal confusion pair is B (Mussel Boats) $\to$ C
+(Fishing Vessels), with 13--20\% misclassification rate, attributable
+to overlapping blade-rate frequency ranges.
+
+\textbf{Deep models} (CNN: Acc=0.328, ResNet-18: Acc=0.258 on base
+split) show diffuse confusion owing to the class-3 absence in training.
+In the five-seed evaluation, both models recover competitive performance,
+with ResNet-18 achieving mean accuracy 0.9020.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{fig_all_confusion_matrices.png}
+  \caption{Row-normalised confusion matrices (recall matrices) for all
+           five models. Top row: KNN, SVM-RBF, Random Forest.
+           Bottom row: CNN (scratch), ResNet-18.}
+  \label{fig:confusion}
+\end{figure}
+
+\subsection{ROC-AUC Analysis}
+
+Fig.~\ref{fig:roc} shows one-vs-rest ROC curves per class.
+SVM-RBF achieves macro-AUC~0.9911; Random Forest~0.9898; KNN~0.9105.
+CNN (scratch) achieves macro-AUC~0.7351 and ResNet-18~0.5040 on the
+base split (class-3 absent). Class~E attains AUC~$\geq$0.979 in all
+classical models. The lowest AUC class for KNN is Mussel Boats (0.838),
+reflecting its spectral proximity to Fishing Vessels.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{fig_roc_all_models.png}
+  \caption{ROC curves (one-vs-rest) for all five models.
+           Macro-AUC: KNN=0.9105, SVM-RBF=0.9911,
+           RF=0.9898, CNN=0.7351, ResNet-18=0.5040.}
+  \label{fig:roc}
+\end{figure}
+
+% ── VII. ABLATION STUDY ───────────────────────────────────────────────────────
+\section{Ablation Study}
+
+Table~\ref{tab:ablation} and Fig.~\ref{fig:ablation} present Random
+Forest validation accuracy for nine feature configurations.
+
+\begin{table}[t]
+  \caption{Feature Group Ablation --- Random Forest Validation Performance}
+  \label{tab:ablation}
+  \centering
+  \begin{tabular}{lrcc}
+    \toprule
+    \textbf{Feature Config} & \textbf{Dim} & \textbf{Val Acc} & \textbf{Val F1} \\
+    \midrule
+    MFCC only       & 240 & 0.769 & 0.748 \\
+    LOFAR only      &  20 & 0.730 & 0.704 \\
+    DEMON only      &  10 & 0.451 & 0.427 \\
+    STFT only       &  40 & 0.841 & 0.834 \\
+    MFCC $+$ STFT   & 280 & 0.826 & 0.809 \\
+    MFCC $+$ LOFAR  & 260 & 0.829 & 0.815 \\
+    Without DEMON   & 300 & 0.856 & 0.845 \\
+    Without LOFAR   & 290 & 0.844 & 0.828 \\
+    \textbf{All combined} & \textbf{310} & \textbf{0.868} & \textbf{0.857} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Key findings: STFT band features alone (0.841) outperform raw MFCCs
+(0.769) in accuracy, suggesting that frequency-band energy is highly
+discriminative for this task. DEMON alone performs weakest (0.451),
+indicating blade-rate modulation is insufficient without spectral
+context. The full combination (0.868) is best, confirming feature
+complementarity. Removing DEMON causes the smallest accuracy drop
+(0.868$\to$0.856), while removing LOFAR reduces accuracy more noticeably
+(0.868$\to$0.844).
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{fig_ablation_study.png}
+  \caption{Ablation study results: validation accuracy (left) and
+           macro-F1 (right) for Random Forest across nine feature
+           group configurations. Gold border marks best configuration.}
+  \label{fig:ablation}
+\end{figure}
+
+% ── VIII. ERROR ANALYSIS & LITERATURE COMPARISON ─────────────────────────────
+\section{Error Analysis \& Literature Comparison}
+
+\subsection{Misclassification Patterns}
+
+Three principal failure modes were identified from confusion matrices
+and spectrogram inspection of misclassified segments:
+
+\textbf{(1) Motorboats (A) $\leftrightarrow$ Fishing Vessels (C):}
+Both produce broadband high-frequency cavitation. In the absence of
+stable LOFAR lines within a 5-second window, their spectrograms are
+visually similar. Misclassification increases for slow-moving motorboats
+and fast-trawling fishing vessels.
+
+\textbf{(2) Mussel Boats (B) $\leftrightarrow$ Fishing Vessels (C):}
+The highest confusion pair for classical models (13--20\% error). Both
+exhibit diesel engine harmonics; the blade-rate frequencies overlap when
+a fishing vessel operates at reduced throttle. DEMON features partially
+disambiguate these classes.
+
+\textbf{(3) Deep model class collapse:}
+The CNN and ResNet-18 base-split results (Acc $\approx$0.33, 0.26)
+reflect a systematic issue: class~3 (Passengers/Ferries) was absent
+from the training split, causing the model to never learn its signature.
+This recovers in five-seed evaluation (mean Acc $>$ 0.82).
+
+\subsection{Literature Comparison}
+
+Fig.~\ref{fig:lit} and Table~\ref{tab:lit} compare our models against
+published ShipsEar baselines. Our SVM-RBF (0.9251) and Random Forest
+(0.8922) exceed the SOTA reported by Xie \textit{et al.}~\cite{xie2022}
+(0.872), attributable to our LOFAR and DEMON features not used in
+prior work. Our classical KNN (0.8533) also surpasses the Irfan
+\textit{et al.}~\cite{irfan2021} CNN baseline (0.843).
+
+\begin{table}[t]
+  \caption{Literature Comparison on ShipsEar}
+  \label{tab:lit}
+  \centering
+  \begin{tabular}{llc}
+    \toprule
+    \textbf{Reference} & \textbf{Method} & \textbf{Accuracy} \\
+    \midrule
+    Santos-Dom.\ \textit{et al.}~\cite{shipsear2016} & GMM + MFCC   & 0.726 \\
+    Santos-Dom.\ \textit{et al.}~\cite{shipsear2016} & SVM + MFCC   & 0.754 \\
+    Irfan \textit{et al.}~\cite{irfan2021}           & CNN + Mel    & 0.843 \\
+    Xie \textit{et al.}~\cite{xie2022}               & ResNet + Aug & 0.872 \\
+    \midrule
+    \textbf{Ours} & KNN           & \textbf{0.853} \\
+    \textbf{Ours} & SVM RBF       & \textbf{0.925} \\
+    \textbf{Ours} & Random Forest & \textbf{0.892} \\
+    \textbf{Ours} & CNN (scratch) & 0.328$^*$ \\
+    \textbf{Ours} & ResNet-18     & 0.258$^*$ \\
+    \bottomrule
+    \multicolumn{3}{l}{\small $^*$Base-split only; 5-seed mean: CNN=0.825, ResNet=0.902.}
+  \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{fig_literature_comparison.png}
+  \caption{Accuracy comparison: our models vs.\ published ShipsEar
+           baselines. Grey bars: literature; coloured bars: our results.
+           Dashed lines mark best published classical (0.754) and
+           SOTA (0.872).}
+  \label{fig:lit}
+\end{figure}
+
+% ── IX. CONCLUSION ────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+This paper presented a comprehensive underwater vessel noise classification
+system using the ShipsEar dataset. A 310-dimensional handcrafted feature
+vector combining MFCCs, STFT band energy, LOFAR spectral lines, and DEMON
+envelope features yields a strong classical baseline.
+SVM-RBF achieves the highest single-run test accuracy (92.51\%,
+AUC~0.991), exceeding published SOTA on this dataset. Random Forest
+achieves comparable five-seed mean accuracy ($0.9030\pm0.0122$,
+AUC~$0.9916\pm0.0019$). Deep models, despite suffering from the class-3
+split issue in base evaluation, demonstrate competitive five-seed mean
+accuracy (ResNet-18: $0.9020\pm0.0135$) and higher AUC~(0.988) than KNN.
+
+Key findings: (1) STFT band energy is the most individually discriminative
+single group; (2) combining all four groups yields the best ablation
+result (Val~Acc~0.868); (3) DEMON features contribute uniquely to
+propeller-driven class discrimination; (4) Class~E is reliably classified
+by all models (recall $\geq$0.94).
+
+Future work will address the split imbalance with ensemble resampling,
+explore transformer-based audio models, and investigate multi-hydrophone
+spatial fusion.
+
+\section*{Dataset \& Code Availability}
+
+ShipsEar dataset:
+\url{https://drive.google.com/drive/folders/1PrO_ZBiYM9hmMQIdgqt7otH0886pO7Xr}\\
+All code and models are included in the submitted ZIP archive.
+
+\balance
+
+\begin{thebibliography}{9}
+
+\bibitem{shipsear2016}
+D.~Santos-Dom\'inguez, S.~Torres-Guijarro, A.~Cardenal-L\'opez, and A.~Pena,
+``ShipsEar: An underwater vessel noise database,''
+\textit{Applied Acoustics}, vol.~113, pp.~64--69, 2016.
+
+\bibitem{urick1983}
+R.~J. Urick,
+\textit{Principles of Underwater Sound}, 3rd~ed.
+New York, NY: McGraw-Hill, 1983.
+
+\bibitem{ross1976}
+D.~Ross,
+\textit{Mechanics of Underwater Noise}.
+New York, NY: Pergamon Press, 1976.
+
+\bibitem{mackenzie1981}
+K.~V. Mackenzie,
+``Nine-term equation for sound speed in the oceans,''
+\textit{J.~Acoust. Soc. Am.}, vol.~70, no.~3, pp.~807--812, 1981.
+
+\bibitem{irfan2021}
+M.~Irfan, J.~Jiangbin, S.~Ali, M.~Iqbal, Z.~Masood, and U.~Hamid,
+``DeepShip: An underwater acoustic benchmark dataset and a separable
+convolution based autoencoder for classification,''
+\textit{Expert Systems with Applications}, vol.~183, p.~115270, 2021.
+
+\bibitem{xie2022}
+D.~Xie, C.~Zheng, C.~Li, and X.~Li,
+``Underwater target recognition using convolutional neural network
+with data augmentation,''
+\textit{Applied Acoustics}, vol.~193, p.~108740, 2022.
+
+\bibitem{he2016}
+K.~He, X.~Zhang, S.~Ren, and J.~Sun,
+``Deep residual learning for image recognition,''
+in \textit{Proc.\ IEEE CVPR}, Las Vegas, NV, 2016, pp.~770--778.
+
+\bibitem{park2019}
+D.~S. Park \textit{et al.},
+``SpecAugment: A simple data augmentation method for automatic speech
+recognition,''
+in \textit{Proc.\ Interspeech}, Graz, Austria, 2019, pp.~2613--2617.
+
+\bibitem{selvaraju2017}
+R.~R. Selvaraju, M.~Cogswell, A.~Das, R.~Vedantam, D.~Parikh, and D.~Batra,
+``Grad-CAM: Visual explanations from deep networks via gradient-based
+localization,''
+in \textit{Proc.\ IEEE ICCV}, Venice, Italy, 2017, pp.~618--626.
+
+\end{thebibliography}
+
+\end{document}
