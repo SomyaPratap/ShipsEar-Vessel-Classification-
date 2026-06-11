@@ -1,3 +1,8 @@
+![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.10-orange?logo=pytorch)
+![Colab](https://img.shields.io/badge/Platform-Google%20Colab-yellow?logo=googlecolab)
+![License](https://img.shields.io/badge/License-Academic-green)
+![UPES](https://img.shields.io/badge/Institution-UPES%20Dehradun-navy)
 # 🚢 Underwater Vessel Noise Classification — ShipsEar Dataset
 
 > **PVR Lab Course Project** | School of Computer Science | UPES Dehradun
